@@ -16,16 +16,20 @@ producción se reemplazaría por PostgreSQL + Redis y el adaptador real de Legad
    - **Idempotencia:** el ID de cada mensaje de Meta se registra; si el evento se
      repite, no se crea un segundo borrador.
    - Descarga fotos con el token y las guarda en `./media/`.
-3. Clasificador de intención por reglas:
-   - Palabras como *foto, guarda, recuerdo, contar* → intención **recuerdo**.
-   - *estado, cómo quedó, mis actividades* → lista de actividades.
-   - Si no se reconoce → pide aclaración.
+3. Clasificador amplio de intención (local, sin API externa):
+   - Normaliza el texto (minúsculas, sin tildes) y puntúa grupos de frases.
+   - Intenciones: `recuerdo`, `estado`, `ayuda`, `quien_eres`, `saludo`,
+     `gracias`, `despedida`, `si`, `no`, `reintentar`.
+   - Entiende formulaciones libres ("te mando esta foto de mi infancia",
+     "quiero conservar este momento", "¿cómo quedó lo que empezamos?").
 4. Flujo "recuerdo":
-   - Foto sin relato → pregunta por el relato y conserva el contexto.
-   - Texto inicial ("Guarda esta foto y lo que te voy a contar") → confirma y espera la foto.
-   - Foto + relato → crea el borrador (`act-0001`, …) con estado **terminado** y responde:
+   - Foto sin relato → pregunta por el relato (acepta texto o nota de voz).
+   - Nota de voz → se descarga y se guarda como relato del recuerdo.
+   - Texto inicial libre → confirma y espera la foto.
+   - Foto + relato (texto o audio) → crea el borrador (`act-0001`, …) con estado **terminado** y responde:
      *"Recuerdo preparado. ¿Quieres agregar personas y fecha?"* + enlace profundo
      (marcador `https://legadovivo.example/borrador/{id}`, se reemplaza por el dominio real).
+   - Si respondes "sí", te pide personas y fecha y los anota en el borrador.
 5. Estados: `recibido`, `requiere información`, `procesando`, `terminado`, `error`.
 
 ## Instalación

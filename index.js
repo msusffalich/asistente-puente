@@ -1,9 +1,10 @@
 'use strict';
 
 /**
- * Asistente Puente - Prototipo Fase 1
- * Webhook de WhatsApp Cloud API: recibe mensajes, clasifica la intencion
- * "recuerdo" y crea borradores en el almacen local (adaptador Legado Vivo).
+ * Asistente Puente - Prototipo Fase 1 (pulido)
+ * Webhook de WhatsApp Cloud API: recibe texto, fotos y notas de voz,
+ * clasifica la intencion con un clasificador amplio local y crea
+ * borradores en el almacen local (adaptador Legado Vivo).
  */
 
 const Fastify = require('fastify');
@@ -59,7 +60,7 @@ function deepLink(activityId) {
   return `${DEEP_LINK_BASE}/${activityId}`;
 }
 
-// ---- Verificacion del webhook (la usa Meta una sola vez al configurarlo) ----
+// ---- Verificacion del webhook (la usa Meta al configurarlo) ----
 fastify.get('/webhook', async (req, reply) => {
   const mode = req.query['hub.mode'];
   const token = req.query['hub.verify_token'];
@@ -103,6 +104,27 @@ async function handleWebhook(payload) {
   }
 }
 
+function clearDetailState(waId) {
+  const s = store.getSession(waId);
+  s.awaitingDetails = null;
+  s.awaitingDetailsAnswer = false;
+  store.saveSession(s);
+}
+
+async function saveDetails(waId, activityId, text) {
+  const activity = store.getActivity(activityId);
+  if (activity) {
+    store.updateActivity(activityId, { detalles: text });
+    clearDetailState(waId);
+    await safeSend(
+      waId,
+      `Anotado: "${text}". Tu recuerdo quedó completo.\n${deepLink(activityId)}`
+    );
+  } else {
+    clearDetailState(waId);
+  }
+}
+
 async function handleMessage(msg) {
   const messageId = msg.id;
   const waId = msg.from;
@@ -116,24 +138,191 @@ async function handleMessage(msg) {
   store.markProcessed(messageId, { from: waId, type });
 
   const text = type === 'text' ? msg.text?.body || '' : '';
-  const intent = type === 'image' ? 'recuerdo' : classify(text);
-  fastify.log.info({ messageId, waId, type, intent }, 'Mensaje recibido.');
+  const cls =
+    type === 'image'
+      ? { intent: 'recuerdo', score: 99 }
+      : type === 'audio'
+        ? { intent: 'audio', score: 99 }
+        : classify(text);
+  fastify.log.info({ messageId, waId, type, intent: cls.intent }, 'Mensaje recibido.');
 
-  if (intent === 'estado') {
-    await handleStatusCommand(waId);
+  // Tipos aun no soportados (video, documento, sticker, ubicacion...).
+  if (!['text', 'image', 'audio'].includes(type)) {
+    await safeSend(
+      waId,
+      'Por ahora solo entiendo texto, fotos y notas de voz. Mándame una foto del recuerdo y cuéntame su historia.'
+    );
     return;
   }
-  if (intent === 'recuerdo') {
-    await handleRecuerdo(waId, messageId, type, msg, text);
+
+  if (type === 'audio') {
+    await handleAudio(waId, messageId, msg);
     return;
   }
 
-  // Intencion no reconocida: pedir aclaracion (una sola pregunta clara).
-  await safeSend(
-    waId,
-    'Hola, soy el Asistente Puente (piloto). Puedo ayudarte a guardar un recuerdo: ' +
-      'envíame una foto y cuéntame la historia. Si quieres ver tus actividades, escribe "estado".'
-  );
+  const session = store.getSession(waId);
+
+  // --- Captura de personas/fecha pendiente (pregunta "¿Quieres agregar personas y fecha?") ---
+  if (session.awaitingDetailsAnswer) {
+    if (cls.intent === 'no') {
+      clearDetailState(waId);
+      await safeSend(waId, 'Sin problema, el recuerdo quedó guardado.');
+      return;
+    }
+    await saveDetails(waId, session.awaitingDetails, text);
+    return;
+  }
+  if (session.awaitingDetails) {
+    if (cls.intent === 'no') {
+      clearDetailState(waId);
+      await safeSend(waId, 'De acuerdo, el recuerdo quedó guardado igual.');
+      return;
+    }
+    if (cls.intent === 'si') {
+      session.awaitingDetailsAnswer = true;
+      store.saveSession(session);
+      await safeSend(waId, 'Cuéntame: ¿qué personas aparecen y de qué fecha es el recuerdo?');
+      return;
+    }
+    // El usuario dio los datos directamente sin decir "si": se guardan igual.
+    await saveDetails(waId, session.awaitingDetails, text);
+    return;
+  }
+
+  // --- Intenciones conversacionales ---
+  switch (cls.intent) {
+    case 'estado':
+      await handleStatusCommand(waId);
+      return;
+    case 'ayuda':
+      await safeSend(
+        waId,
+        'Soy el Asistente Puente (piloto). Puedo:\n' +
+          '• Guardar un recuerdo: mándame una foto y cuéntame su historia (por texto o nota de voz).\n' +
+          '• Agregar personas y fecha a tu recuerdo.\n' +
+          '• Mostrarte tus actividades: escribe "estado".'
+      );
+      return;
+    case 'saludo': {
+      const open = store.openActivity(waId);
+      const extra = open
+        ? ' Veo que tienes un recuerdo en curso: ' +
+          (!open.photoReceived
+            ? 'todavía me falta la foto.'
+            : 'ya tengo la foto, solo me falta el relato.')
+        : ' ¿Guardamos un recuerdo? Mándame una foto.';
+      await safeSend(waId, `Hola. Soy el Asistente Puente.${extra}`);
+      return;
+    }
+    case 'gracias':
+      await safeSend(waId, 'De nada. Aquí estoy cuando quieras guardar otro recuerdo.');
+      return;
+    case 'despedida':
+      await safeSend(waId, 'Hasta luego. Tus recuerdos quedan guardados.');
+      return;
+    case 'quien_eres':
+      await safeSend(
+        waId,
+        'Soy el Asistente Puente: recibo lo que me mandas por WhatsApp y lo convierto en borradores para tus apps. En este piloto trabajo con recuerdos.'
+      );
+      return;
+    case 'reintentar': {
+      const acts = store.listActivities(waId);
+      const failed = acts.find((a) => a.status === 'error');
+      if (failed) {
+        await finishRecuerdo(waId, failed);
+      } else {
+        await safeSend(waId, 'No veo ningún recuerdo con error. ¿Creamos uno nuevo? Mándame una foto.');
+      }
+      return;
+    }
+    case 'recuerdo':
+      await handleRecuerdo(waId, messageId, type, msg, text);
+      return;
+    case 'si':
+    case 'no': {
+      // "si"/"no" sin contexto de pregunta: si hay un recuerdo abierto,
+      // se trata como parte de la conversacion del recuerdo.
+      const open = store.openActivity(waId);
+      if (open) {
+        await handleRecuerdo(waId, messageId, type, msg, text);
+      } else {
+        await safeSend(waId, '¿En qué te ayudo? Puedo guardar un recuerdo con una foto o mostrarte tus actividades con "estado".');
+      }
+      return;
+    }
+    default: {
+      // Texto libre: si hay un recuerdo abierto, se toma como parte de el
+      // (relato o contexto). Si no, se ofrece ayuda.
+      const open = store.openActivity(waId);
+      if (open) {
+        await handleRecuerdo(waId, messageId, type, msg, text);
+      } else {
+        await safeSend(
+          waId,
+          'Hola, soy el Asistente Puente (piloto). Puedo guardar un recuerdo: envíame una foto y cuéntame la historia (también vale una nota de voz). Escribe "ayuda" para ver qué sé hacer.'
+        );
+      }
+    }
+  }
+}
+
+async function handleAudio(waId, messageId, msg) {
+  const session = store.getSession(waId);
+  let audioFile = null;
+  try {
+    audioFile = await downloadMedia(msg.audio?.id, messageId);
+  } catch (err) {
+    fastify.log.error(err, 'No se pudo descargar el audio.');
+  }
+
+  let activity = store.openActivity(waId);
+
+  if (!activity) {
+    // Nota de voz sin recuerdo abierto: se guarda como relato pendiente.
+    activity = store.addActivity({
+      id: store.nextActivityId(),
+      userWaId: waId,
+      app: 'legado-vivo',
+      intent: 'recuerdo',
+      status: 'requiere información',
+      photoReceived: false,
+      photo: null,
+      relato: '[nota de voz]',
+      relatoAudio: audioFile ? { ...audioFile, mediaId: msg.audio?.id } : null,
+      relatoAudioError: audioFile ? null : 'No se pudo descargar el audio.',
+      idempotencyKey: messageId,
+      createdAt: now(),
+      updatedAt: now(),
+    });
+    session.openActivityId = activity.id;
+    store.saveSession(session);
+    await safeSend(
+      waId,
+      'Recibí tu nota de voz y la guardé como relato. Ahora envíame la foto del recuerdo.'
+    );
+    return;
+  }
+
+  if (!activity.photoReceived) {
+    store.updateActivity(activity.id, {
+      relatoAudio: audioFile ? { ...audioFile, mediaId: msg.audio?.id } : activity.relatoAudio,
+      relatoAudioError: audioFile ? null : 'No se pudo descargar el audio.',
+      ...(activity.relato ? {} : { relato: '[nota de voz]' }),
+      status: 'requiere información',
+    });
+    await safeSend(waId, 'Nota de voz guardada como relato. Ahora envíame la foto del recuerdo.');
+    return;
+  }
+
+  // Ya hay foto: la nota de voz completa el relato.
+  store.updateActivity(activity.id, {
+    relatoAudio: audioFile ? { ...audioFile, mediaId: msg.audio?.id } : activity.relatoAudio,
+    relatoAudioError: audioFile ? null : 'No se pudo descargar el audio.',
+    ...(activity.relato ? {} : { relato: '[nota de voz]' }),
+    status: 'procesando',
+  });
+  await finishRecuerdo(waId, store.getActivity(activity.id));
 }
 
 async function handleRecuerdo(waId, messageId, type, msg, text) {
@@ -187,16 +376,15 @@ async function handleRecuerdo(waId, messageId, type, msg, text) {
     } else {
       await safeSend(
         waId,
-        'Foto recibida. Ahora cuéntame el relato: ¿qué quieres recordar de esta foto?'
+        'Foto recibida. Ahora cuéntame el relato: ¿qué quieres recordar de esta foto? (puedes escribirlo o mandarme una nota de voz)'
       );
     }
     return;
   }
 
-  // type === 'text' con intencion recuerdo.
+  // type === 'text' con intencion recuerdo o texto libre dentro de un recuerdo.
   if (!activity) {
-    // Puede ser el mensaje inicial ("Guarda esta foto y lo que te voy a contar")
-    // o directamente el relato sin foto previa.
+    // Mensaje inicial ("Guarda esta foto...") o relato suelto sin foto previa.
     activity = store.addActivity({
       id: store.nextActivityId(),
       userWaId: waId,
@@ -215,7 +403,7 @@ async function handleRecuerdo(waId, messageId, type, msg, text) {
     store.saveSession(session);
     await safeSend(
       waId,
-      'Recibido. Envíame la foto del recuerdo y luego me cuentas la historia.'
+      'Buena idea, guardemos ese recuerdo. Envíame la foto y luego me cuentas la historia.'
     );
     return;
   }
@@ -261,7 +449,13 @@ async function finishRecuerdo(waId, activity) {
     // Aqui el adaptador crearia el borrador en Legado Vivo; en el prototipo
     // el borrador ES el registro local.
     store.updateActivity(activity.id, { status: 'terminado' });
-    store.clearOpenActivity(waId);
+
+    // El recuerdo queda cerrado, pero se abre la ventana para personas/fecha.
+    const session = store.getSession(waId);
+    session.openActivityId = null;
+    session.awaitingDetails = activity.id;
+    session.awaitingDetailsAnswer = false;
+    store.saveSession(session);
 
     await safeSend(
       waId,
@@ -285,7 +479,8 @@ async function handleStatusCommand(waId) {
   }
   const lines = activities.slice(0, 5).map((a) => {
     const fecha = new Date(a.createdAt).toLocaleDateString('es-ES');
-    return `• ${a.id} — recuerdo (${STATUS_LABEL[a.status] || a.status}) — ${fecha}\n  ${deepLink(a.id)}`;
+    const extra = a.detalles ? ` — ${a.detalles}` : '';
+    return `• ${a.id} — recuerdo (${STATUS_LABEL[a.status] || a.status}) — ${fecha}${extra}\n  ${deepLink(a.id)}`;
   });
   await safeSend(waId, `Tus actividades recientes:\n${lines.join('\n')}`);
 }

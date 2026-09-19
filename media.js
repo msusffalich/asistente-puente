@@ -16,6 +16,13 @@ const EXT_BY_MIME = {
   'image/png': '.png',
   'image/webp': '.webp',
   'image/gif': '.gif',
+  // Notas de voz y audios de WhatsApp (las notas de voz llegan como audio/ogg)
+  'audio/ogg': '.ogg',
+  'audio/mpeg': '.mp3',
+  'audio/mp4': '.m4a',
+  'audio/aac': '.aac',
+  'audio/wav': '.wav',
+  'audio/x-wav': '.wav',
 };
 
 function dryRun() {
@@ -47,8 +54,8 @@ async function downloadMedia(mediaId, fileHint) {
   });
   if (!fileRes.ok) throw new Error(`Descarga de medio fallo con ${fileRes.status}`);
 
-  const mime = (meta.mime_type || fileRes.headers.get('content-type') || 'image/jpeg').split(';')[0];
-  const ext = EXT_BY_MIME[mime] || '.jpg';
+  const mime = (meta.mime_type || fileRes.headers.get('content-type') || '').split(';')[0].trim();
+  const ext = EXT_BY_MIME[mime] || (mime.startsWith('audio/') ? '.ogg' : '.jpg');
   const name = `${fileHint || mediaId}${ext}`;
   const dest = path.join(MEDIA_DIR, name);
 
