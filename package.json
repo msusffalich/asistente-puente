@@ -1,1 +1,17 @@
-{"dependencies":{"fastify":"^5.2.0"},"description":"Prototipo del webhook Asistente Puente (Fase 1): WhatsApp Cloud API -> intencion 'recuerdo' -> borrador Legado Vivo","engines":{"node":">=18"},"license":"UNLICENSED","main":"src/index.js","name":"asistente-puente","private":true,"scripts":{"start":"node src/index.js"},"version":"0.1.0"}
+{
+  "dependencies": {
+    "fastify": "^5.2.0"
+  },
+  "description": "Prototipo del webhook Asistente Puente (Fase 1): WhatsApp Cloud API -> intencion 'recuerdo' -> borrador Legado Vivo",
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "UNLICENSED",
+  "main": "index.js",
+  "name": "asistente-puente",
+  "private": true,
+  "scripts": {
+    "start": "node index.js"
+  },
+  "version": "0.1.0"
+}
