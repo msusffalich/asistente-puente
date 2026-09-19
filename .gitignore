@@ -1,0 +1,6 @@
+node_modules/
+.env
+data.json
+media/*
+!media/.gitkeep
+npm-debug.log
