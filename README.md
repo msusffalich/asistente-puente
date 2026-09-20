@@ -4,8 +4,10 @@ Prototipo del webhook **Asistente Puente** según la especificación funcional v
 (`workspace/user/files/Asistente_Puente.docx`, secciones 5 y 7).
 
 **Alcance del piloto:** solo WhatsApp Cloud API + intención **"recuerdo"** hacia
-**Legado Vivo**. El borrador se guarda en un almacén local (`data.json`); en
-producción se reemplazaría por PostgreSQL + Redis y el adaptador real de Legado Vivo.
+**Legado Vivo**. El borrador se guarda en PostgreSQL si existe `DATABASE_URL`
+(persistente: sobrevive reinicios y redespliegues); si no, en un almacén local
+(`data.json`). Las fotos y notas de voz se guardan en la base de datos cuando
+hay Postgres, o en `./media/` en modo local.
 
 ## Qué hace
 
@@ -15,7 +17,8 @@ producción se reemplazaría por PostgreSQL + Redis y el adaptador real de Legad
    - Responde `200` de inmediato y procesa en segundo plano.
    - **Idempotencia:** el ID de cada mensaje de Meta se registra; si el evento se
      repite, no se crea un segundo borrador.
-   - Descarga fotos con el token y las guarda en `./media/`.
+   - Descarga fotos y audios con el token y los guarda en el almacén
+     (PostgreSQL si hay `DATABASE_URL`, `./media/` en modo local).
 3. Clasificador amplio de intención (local, sin API externa):
    - Normaliza el texto (minúsculas, sin tildes) y puntúa grupos de frases.
    - Intenciones: `recuerdo`, `estado`, `ayuda`, `quien_eres`, `saludo`,
@@ -50,6 +53,7 @@ Edita `.env` con tus valores (obtenidos en Meta for Developers):
 | `APP_SECRET`      | App Dashboard → Configuración → Básica → Clave secreta de la app. |
 | `WHATSAPP_TOKEN`  | WhatsApp → API Setup → token temporal (pruebas) o permanente (producción). |
 | `PHONE_NUMBER_ID` | WhatsApp → API Setup → identificador del número. |
+| `DATABASE_URL`    | URL de PostgreSQL (Render, Supabase, Neon...). Sin ella usa `data.json` local. |
 | `DRY_RUN`         | `true` para probar sin llamadas reales a Meta. |
 
 > **Seguridad:** nunca subas el `.env` a git ni pegues tokens en código, chats
@@ -120,6 +124,42 @@ Meta exige una URL pública **HTTPS** para el webhook. Pasos con Render (plan gr
 > Nota: en el plan gratuito el servicio "duerme" tras inactividad; el primer
 > mensaje puede tardar ~30 s en despertar. Para un piloto es aceptable.
 
+## Base de datos PostgreSQL (persistencia real)
+
+Sin `DATABASE_URL`, el bot guarda todo en `data.json` y `./media/` dentro del
+servidor: **ese disco se borra en cada redespliegue o reinicio** (plan gratuito
+de Render). Para que los recuerdos sobrevivan:
+
+1. Crea una base **PostgreSQL** (en Render: **New +** → **PostgreSQL**;
+   también valen Supabase o Neon).
+2. Copia su **External Database URL**.
+3. En tu Web Service → **Environment** → agrega `DATABASE_URL` con ese valor.
+4. Redespliega. Al arrancar verás en los logs `Almacén activo: postgres`.
+
+El bot crea solo sus tablas (`puente_processed`, `puente_sessions`,
+`puente_activities`, `puente_media`) y la secuencia `puente_activity_seq`
+(los IDs nuevos empiezan en `act-10000` para no chocar con los del modo local).
+Fotos y audios se guardan como bytes en `puente_media`, así que nada se pierde.
+
+## Migrar a tu número propio
+
+El número de prueba de Meta solo sirve para pilotos. Para usar tu propio número:
+
+1. **Ese número dejará de funcionar como WhatsApp normal.** Si hoy lo usas en
+   la app de WhatsApp, primero elimina esa cuenta
+   (WhatsApp → Ajustes → Cuenta → Eliminar mi cuenta) o cambia tu WhatsApp
+   personal a otro número. Este paso es obligatorio: un número no puede estar
+   en la app y en la API a la vez.
+2. En [Meta for Developers](https://developers.facebook.com) → tu app
+   **Asistente Puente** → **WhatsApp** → **API Setup** → **Phone numbers** →
+   **Add phone number** → ingresa tu número y verifícalo con el código SMS o
+   por llamada.
+3. Copia el nuevo **Phone Number ID**.
+4. En Render → tu servicio → **Environment** → actualiza `PHONE_NUMBER_ID`
+   con el nuevo valor. El `WHATSAPP_TOKEN` permanente sigue sirviendo (el
+   número pertenece a la misma app).
+5. Redespliega y prueba escribiéndole a tu número desde otro teléfono.
+
 ## Configurar el webhook en Meta
 
 1. Entra a [Meta for Developers](https://developers.facebook.com) → tu app
@@ -139,10 +179,10 @@ Meta exige una URL pública **HTTPS** para el webhook. Pasos con Render (plan gr
 asistente-puente/
 ├── src/
 │   ├── index.js      # Servidor Fastify, rutas GET/POST /webhook, flujo recuerdo
-│   ├── store.js      # Almacén local JSON (idempotencia, sesiones, actividades)
+│   ├── store.js      # Almacén dual: PostgreSQL (DATABASE_URL) o JSON local
 │   ├── intent.js     # Clasificador de intención por reglas
 │   ├── whatsapp.js   # Envío de mensajes por Graph API
-│   └── media.js      # Descarga de fotos a ./media/
+│   └── media.js      # Descarga de fotos/audios a memoria (los guarda store.js)
 ├── media/            # Fotos descargadas (ignorado por git)
 ├── data.json         # Base local (se crea sola, ignorada por git)
 ├── package.json
@@ -152,8 +192,9 @@ asistente-puente/
 
 ## Limitaciones conocidas del prototipo
 
-- El "borrador de Legado Vivo" es un registro local; no existe aún la app real.
+- El "borrador de Legado Vivo" es un registro en la base de datos; no existe
+  aún la app real.
 - El enlace profundo es un marcador (`legadovivo.example`).
 - Sin cola de trabajos ni reintentos persistentes (Fase 1: flujo síncrono simple).
-- El token temporal de Meta vence en horas; para operación continua se necesita
-  el token permanente con la configuración de negocio autorizada.
+- El audio se guarda como archivo del recuerdo; no hay transcripción a texto
+  (requeriría un servicio como Whisper).
