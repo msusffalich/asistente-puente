@@ -7,7 +7,8 @@ Prototipo del webhook **Asistente Puente** según la especificación funcional v
 **Legado Vivo**. El borrador se guarda en PostgreSQL si existe `DATABASE_URL`
 (persistente: sobrevive reinicios y redespliegues); si no, en un almacén local
 (`data.json`). Las fotos y notas de voz se guardan en la base de datos cuando
-hay Postgres, o en `./media/` en modo local.
+hay Postgres, o en `./media/` en modo local. Las notas de voz se transcriben
+a texto con Whisper si existe `OPENAI_API_KEY`.
 
 ## Qué hace
 
@@ -27,7 +28,9 @@ hay Postgres, o en `./media/` en modo local.
      "quiero conservar este momento", "¿cómo quedó lo que empezamos?").
 4. Flujo "recuerdo":
    - Foto sin relato → pregunta por el relato (acepta texto o nota de voz).
-   - Nota de voz → se descarga y se guarda como relato del recuerdo.
+   - Nota de voz → se descarga, se transcribe a texto con Whisper (si hay
+     `OPENAI_API_KEY`) y el texto queda como relato del recuerdo. Sin clave,
+     se guarda solo el audio.
    - Texto inicial libre → confirma y espera la foto.
    - Foto + relato (texto o audio) → crea el borrador (`act-0001`, …) con estado **terminado** y responde:
      *"Recuerdo preparado. ¿Quieres agregar personas y fecha?"* + enlace profundo
@@ -54,6 +57,7 @@ Edita `.env` con tus valores (obtenidos en Meta for Developers):
 | `WHATSAPP_TOKEN`  | WhatsApp → API Setup → token temporal (pruebas) o permanente (producción). |
 | `PHONE_NUMBER_ID` | WhatsApp → API Setup → identificador del número. |
 | `DATABASE_URL`    | URL de PostgreSQL (Render, Supabase, Neon...). Sin ella usa `data.json` local. |
+| `OPENAI_API_KEY`  | Clave de OpenAI (platform.openai.com) para transcribir notas de voz con Whisper. Opcional. |
 | `DRY_RUN`         | `true` para probar sin llamadas reales a Meta. |
 
 > **Seguridad:** nunca subas el `.env` a git ni pegues tokens en código, chats
@@ -141,9 +145,35 @@ El bot crea solo sus tablas (`puente_processed`, `puente_sessions`,
 (los IDs nuevos empiezan en `act-10000` para no chocar con los del modo local).
 Fotos y audios se guardan como bytes en `puente_media`, así que nada se pierde.
 
+## Transcripción de notas de voz (Whisper)
+
+Sin configuración extra, el bot guarda el audio y el relato queda como
+`[nota de voz]`. Para que transcriba el audio a texto:
+
+1. Crea una cuenta en [platform.openai.com](https://platform.openai.com) y
+   genera una **API key** en **API keys**.
+2. En Render → tu servicio → **Environment** → agrega `OPENAI_API_KEY`
+   con ese valor → **Save Changes**.
+3. Al arrancar verás en los logs `Transcripción de voz: activada (Whisper)`.
+
+Comportamiento:
+
+- Cada nota de voz se transcribe al recibirla; el texto queda guardado como
+  relato del recuerdo (campo `relato`, origen `transcripcion`) y el bot te
+  responde mostrándote la transcripción para que la verifiques.
+- El audio original se sigue guardando igual que antes.
+- Si la transcripción falla (o no hay clave), el flujo no se interrumpe:
+  el recuerdo continúa con el audio guardado.
+- Costo aproximado: Whisper cuesta ~$0.006 USD por minuto de audio; una nota
+  de voz típica cuesta una fracción de centavo.
+
+> **Seguridad:** la clave de OpenAI es un secreto: guárdala solo en las
+> variables de entorno de Render, nunca en el código ni en el chat.
+
 ## Migrar a tu número propio
 
 El número de prueba de Meta solo sirve para pilotos. Para usar tu propio número:
+
 
 1. **Ese número dejará de funcionar como WhatsApp normal.** Si hoy lo usas en
    la app de WhatsApp, primero elimina esa cuenta
@@ -182,6 +212,7 @@ asistente-puente/
 │   ├── store.js      # Almacén dual: PostgreSQL (DATABASE_URL) o JSON local
 │   ├── intent.js     # Clasificador de intención por reglas
 │   ├── whatsapp.js   # Envío de mensajes por Graph API
+│   ├── transcribe.js # Transcripción de notas de voz con Whisper (OpenAI)
 │   └── media.js      # Descarga de fotos/audios a memoria (los guarda store.js)
 ├── media/            # Fotos descargadas (ignorado por git)
 ├── data.json         # Base local (se crea sola, ignorada por git)
@@ -196,5 +227,5 @@ asistente-puente/
   aún la app real.
 - El enlace profundo es un marcador (`legadovivo.example`).
 - Sin cola de trabajos ni reintentos persistentes (Fase 1: flujo síncrono simple).
-- El audio se guarda como archivo del recuerdo; no hay transcripción a texto
-  (requeriría un servicio como Whisper).
+- La transcripción de voz requiere `OPENAI_API_KEY`; sin ella el audio se
+  guarda pero sin texto.

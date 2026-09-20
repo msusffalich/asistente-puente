@@ -1,9 +1,10 @@
 'use strict';
 
 /**
- * Asistente Puente - Prototipo Fase 1 (endurecido)
+ * Asistente Puente - Prototipo Fase 1 (endurecido, v4)
  * Webhook de WhatsApp Cloud API: recibe texto, fotos y notas de voz,
- * clasifica la intencion con un clasificador amplio local y crea
+ * clasifica la intencion con un clasificador amplio local, transcribe las
+ * notas de voz con Whisper (si hay OPENAI_API_KEY) y crea
  * borradores (adaptador Legado Vivo).
  *
  * Almacén: PostgreSQL si existe DATABASE_URL, data.json local si no.
@@ -16,6 +17,7 @@ const store = require('./store');
 const { classify } = require('./intent');
 const { sendText } = require('./whatsapp');
 const { downloadMediaBuffer, extForMime } = require('./media');
+const { transcribeAudio, transcriptionEnabled } = require('./transcribe');
 
 const PORT = Number(process.env.PORT || 3000);
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || '';
@@ -92,6 +94,7 @@ fastify.get('/', async () => ({
   servicio: 'Asistente Puente (prototipo Fase 1)',
   estado: 'activo',
   almacen: store.backend,
+  transcripcion: transcriptionEnabled() ? 'whisper' : 'desactivada',
   hora: now(),
 }));
 
@@ -146,7 +149,9 @@ async function saveIncomingMedia(mediaId, messageId, kind, meta) {
     bytes: dl.buffer,
     meta: { ...(meta || {}), mediaId },
   });
-  return { ...ref, mediaId };
+  // El buffer se devuelve para usos en memoria (ej. transcripción);
+  // no se persiste en el descriptor guardado.
+  return { ...ref, mediaId, buffer: dl.buffer };
 }
 
 async function handleMessage(msg) {
@@ -222,7 +227,7 @@ async function handleMessage(msg) {
       await safeSend(
         waId,
         'Soy el Asistente Puente (piloto). Puedo:\n' +
-          '• Guardar un recuerdo: mándame una foto y cuéntame su historia (por texto o nota de voz).\n' +
+          '• Guardar un recuerdo: mándame una foto y cuéntame su historia (por texto o nota de voz; la voz la transcribo a texto).\n' +
           '• Agregar personas y fecha a tu recuerdo.\n' +
           '• Mostrarte tus actividades: escribe "estado".'
       );
@@ -293,6 +298,25 @@ async function handleAudio(waId, messageId, msg) {
   const session = await store.getSession(waId);
   const audioFile = await saveIncomingMedia(msg.audio?.id, messageId, 'audio', {});
 
+  // Transcribir la nota de voz a texto (si hay clave de OpenAI configurada).
+  // Si falla o no hay clave, se conserva el audio sin texto (comportamiento v3).
+  let transcripcion = null;
+  if (audioFile && audioFile.buffer) {
+    try {
+      transcripcion = await transcribeAudio(audioFile.buffer, {
+        filename: `${messageId}${extForMime(audioFile.mime)}`,
+        mime: audioFile.mime,
+      });
+    } catch (err) {
+      fastify.log.error(err, 'Error transcribiendo audio.');
+    }
+    delete audioFile.buffer; // liberar memoria: el descriptor ya no lo necesita
+  }
+  const relatoTexto = transcripcion || '[nota de voz]';
+  const acuse = transcripcion
+    ? `Transcribí tu nota de voz: "${transcripcion}".`
+    : 'Recibí tu nota de voz y la guardé como relato.';
+
   let activity = await store.openActivity(waId);
 
   if (!activity) {
@@ -305,7 +329,8 @@ async function handleAudio(waId, messageId, msg) {
       status: 'requiere información',
       photoReceived: false,
       photo: null,
-      relato: '[nota de voz]',
+      relato: relatoTexto,
+      relatoOrigen: transcripcion ? 'transcripcion' : 'audio',
       relatoAudio: audioFile ? { ...audioFile } : null,
       relatoAudioError: audioFile ? null : 'No se pudo descargar el audio.',
       idempotencyKey: messageId,
@@ -315,7 +340,7 @@ async function handleAudio(waId, messageId, msg) {
     if (audioFile) await store.linkMedia(audioFile.ref, activity.id);
     session.openActivityId = activity.id;
     await store.saveSession(session);
-    await safeSend(waId, 'Recibí tu nota de voz y la guardé como relato. Ahora envíame la foto del recuerdo.');
+    await safeSend(waId, `${acuse} Ahora envíame la foto del recuerdo.`);
     return;
   }
 
@@ -323,11 +348,13 @@ async function handleAudio(waId, messageId, msg) {
     await store.updateActivity(activity.id, {
       relatoAudio: audioFile ? { ...audioFile } : activity.relatoAudio,
       relatoAudioError: audioFile ? null : 'No se pudo descargar el audio.',
-      ...(activity.relato ? {} : { relato: '[nota de voz]' }),
+      ...(activity.relato
+        ? {}
+        : { relato: relatoTexto, relatoOrigen: transcripcion ? 'transcripcion' : 'audio' }),
       status: 'requiere información',
     });
     if (audioFile) await store.linkMedia(audioFile.ref, activity.id);
-    await safeSend(waId, 'Nota de voz guardada como relato. Ahora envíame la foto del recuerdo.');
+    await safeSend(waId, `${acuse} Ahora envíame la foto del recuerdo.`);
     return;
   }
 
@@ -335,7 +362,9 @@ async function handleAudio(waId, messageId, msg) {
   await store.updateActivity(activity.id, {
     relatoAudio: audioFile ? { ...audioFile } : activity.relatoAudio,
     relatoAudioError: audioFile ? null : 'No se pudo descargar el audio.',
-    ...(activity.relato ? {} : { relato: '[nota de voz]' }),
+    ...(activity.relato
+      ? {}
+      : { relato: relatoTexto, relatoOrigen: transcripcion ? 'transcripcion' : 'audio' }),
     status: 'procesando',
   });
   if (audioFile) await store.linkMedia(audioFile.ref, activity.id);
@@ -507,6 +536,9 @@ async function safeSend(to, body) {
 async function start() {
   await store.init();
   fastify.log.info(`Almacén activo: ${store.backend}`);
+  fastify.log.info(
+    `Transcripción de voz: ${transcriptionEnabled() ? 'activada (Whisper)' : 'desactivada (falta OPENAI_API_KEY)'}`
+  );
   if (!VERIFY_TOKEN) fastify.log.warn('VERIFY_TOKEN no configurado: la verificacion de Meta fallara.');
   if (!APP_SECRET) fastify.log.warn('APP_SECRET no configurado: se rechazaran los eventos entrantes.');
   try {
