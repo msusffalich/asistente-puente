@@ -1,4 +1,7 @@
-# Asistente Puente — Prototipo Fase 1
+# Asistente Puente — Prototipo Fase 1 (v5)
+
+> v5: puente con Legado Vivo. Cada recuerdo completado se envía como borrador
+> ("Pendiente de completar") a la app pública de Legado Vivo en Railway.
 
 Prototipo del webhook **Asistente Puente** según la especificación funcional v1.0
 (`workspace/user/files/Asistente_Puente.docx`, secciones 5 y 7).
@@ -207,25 +210,50 @@ El número de prueba de Meta solo sirve para pilotos. Para usar tu propio númer
 
 ```
 asistente-puente/
-├── src/
-│   ├── index.js      # Servidor Fastify, rutas GET/POST /webhook, flujo recuerdo
-│   ├── store.js      # Almacén dual: PostgreSQL (DATABASE_URL) o JSON local
-│   ├── intent.js     # Clasificador de intención por reglas
-│   ├── whatsapp.js   # Envío de mensajes por Graph API
-│   ├── transcribe.js # Transcripción de notas de voz con Whisper (OpenAI)
-│   └── media.js      # Descarga de fotos/audios a memoria (los guarda store.js)
-├── media/            # Fotos descargadas (ignorado por git)
-├── data.json         # Base local (se crea sola, ignorada por git)
+├── index.js        # Servidor Fastify, rutas GET/POST /webhook, flujo recuerdo
+├── store.js        # Almacén dual: PostgreSQL (DATABASE_URL) o JSON local
+├── intent.js       # Clasificador de intención por reglas
+├── whatsapp.js     # Envío de mensajes por Graph API
+├── transcribe.js   # Transcripción de notas de voz con Whisper (OpenAI)
+├── media.js        # Descarga de fotos/audios a memoria (los guarda store.js)
+├── legado-bridge.js # Puente: envía cada recuerdo a Legado Vivo (Railway)
+├── media/          # Fotos descargadas (ignorado por git)
+├── data.json       # Base local (se crea sola, ignorada por git)
 ├── package.json
 ├── .env.example
 └── README.md
 ```
 
+## Puente con Legado Vivo (app pública)
+
+Cuando un recuerdo se completa (foto + relato), el bot lo envía automáticamente
+como borrador a la app de Legado Vivo, donde queda como **"Pendiente de
+completar"** en la familia configurada. La foto, el audio y la transcripción
+viajan con el borrador.
+
+Configuración (variables de entorno en Render):
+
+| Variable           | Valor |
+|--------------------|-------|
+| `LEGADO_VIVO_URL`  | URL pública de la app, ej. `https://web-production-c3b86.up.railway.app` |
+| `BRIDGE_API_KEY`   | La MISMA clave configurada como `BRIDGE_API_KEY` en la app (Railway) |
+| `LEGADO_FAMILY_ID` | Id numérico de tu familia (se ve en la URL al abrirla: `/families/3`) |
+
+Si falta alguna de las tres, el puente queda desactivado y el bot sigue
+funcionando como antes. El estado se ve en la raíz `/` del servicio
+(`puente_legado: configurado | no configurado`).
+
+Nota: las personas y la fecha que el usuario agregue después por WhatsApp
+(detalles) quedan en el bot; en la app se completan abriendo el recuerdo
+pendiente.
+
 ## Limitaciones conocidas del prototipo
 
-- El "borrador de Legado Vivo" es un registro en la base de datos; no existe
-  aún la app real.
-- El enlace profundo es un marcador (`legadovivo.example`).
+- El enlace profundo sigue siendo un marcador (`legadovivo.example`) salvo que
+  configures `DEEP_LINK_BASE` con la URL real.
 - Sin cola de trabajos ni reintentos persistentes (Fase 1: flujo síncrono simple).
 - La transcripción de voz requiere `OPENAI_API_KEY`; sin ella el audio se
   guarda pero sin texto.
+- El puente envía el borrador al completar el recuerdo; los detalles
+  (personas/fecha) que se agreguen después por WhatsApp no se reenvían:
+  se completan en la app.

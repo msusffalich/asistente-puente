@@ -18,6 +18,7 @@ const { classify } = require('./intent');
 const { sendText } = require('./whatsapp');
 const { downloadMediaBuffer, extForMime } = require('./media');
 const { transcribeAudio, transcriptionEnabled } = require('./transcribe');
+const { bridgeEnabled, forwardDraft } = require('./legado-bridge');
 
 const PORT = Number(process.env.PORT || 3000);
 const VERIFY_TOKEN = process.env.VERIFY_TOKEN || '';
@@ -95,6 +96,7 @@ fastify.get('/', async () => ({
   estado: 'activo',
   almacen: store.backend,
   transcripcion: transcriptionEnabled() ? 'whisper' : 'desactivada',
+  puente_legado: bridgeEnabled() ? 'configurado' : 'no configurado',
   hora: now(),
 }));
 
@@ -488,9 +490,13 @@ async function handleRecuerdo(waId, messageId, type, msg, text) {
 async function finishRecuerdo(waId, activity) {
   try {
     await store.updateActivity(activity.id, { status: 'procesando' });
-    // Aqui el adaptador crearia el borrador en Legado Vivo; en el prototipo
-    // el borrador ES el registro en el almacén.
-    await store.updateActivity(activity.id, { status: 'terminado' });
+    // Puente con Legado Vivo (app pública): envía el borrador si está configurado.
+    // Si no, el borrador sigue siendo el registro en el almacén (comportamiento anterior).
+    let puente = null;
+    if (bridgeEnabled()) {
+      puente = await forwardDraft(activity, store, fastify.log);
+    }
+    await store.updateActivity(activity.id, { status: 'terminado', puenteLegado: puente });
 
     // El recuerdo queda cerrado, pero se abre la ventana para personas/fecha.
     const session = await store.getSession(waId);
@@ -499,7 +505,11 @@ async function finishRecuerdo(waId, activity) {
     session.awaitingDetailsAnswer = false;
     await store.saveSession(session);
 
-    await safeSend(waId, `Recuerdo preparado. ¿Quieres agregar personas y fecha?\n${deepLink(activity.id)}`);
+    const extra =
+      puente && puente.ok
+        ? '\nYa lo guardé en tu familia de Legado Vivo (pendiente de completar).'
+        : '';
+    await safeSend(waId, `Recuerdo preparado. ¿Quieres agregar personas y fecha?${extra}\n${deepLink(activity.id)}`);
   } catch (err) {
     fastify.log.error(err, 'Error finalizando recuerdo.');
     await store.updateActivity(activity.id, { status: 'error' });
