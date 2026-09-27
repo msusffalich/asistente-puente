@@ -1,7 +1,12 @@
-# Asistente Puente — Prototipo Fase 1 (v5)
+# Asistente Puente — Prototipo Fase 1 (v6)
 
 > v5: puente con Legado Vivo. Cada recuerdo completado se envía como borrador
 > ("Pendiente de completar") a la app pública de Legado Vivo en Railway.
+> v6: persistencia mayor del puente — reintentos con backoff (4 intentos,
+> timeout 45s, warmup de Railway), entrega en segundo plano sin bloquear el
+> webhook, aviso honesto al usuario si falla ("reintentar" reintenta todo lo
+> pendiente) y barrido automático al arrancar que recupera los borradores que
+> nunca llegaron.
 
 Prototipo del webhook **Asistente Puente** según la especificación funcional v1.0
 (`workspace/user/files/Asistente_Puente.docx`, secciones 5 y 7).

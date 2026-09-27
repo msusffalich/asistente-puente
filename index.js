@@ -32,6 +32,7 @@ const STATUS_LABEL = {
   recibido: 'Recibido',
   'requiere información': 'Requiere información',
   procesando: 'Procesando',
+  entregando: 'Enviando a Legado Vivo',
   terminado: 'Terminado',
   error: 'Error',
 };
@@ -257,9 +258,14 @@ async function handleMessage(msg) {
       return;
     case 'reintentar': {
       const acts = await store.listActivities(waId);
-      const failed = acts.find((a) => a.status === 'error');
-      if (failed) {
-        await finishRecuerdo(waId, failed);
+      const failed = acts.filter(
+        (a) => a.status === 'error' || (a.puenteLegado && a.puenteLegado.ok === false)
+      );
+      if (failed.length) {
+        await safeSend(waId, `Reintentando ${failed.length} recuerdo(s) pendiente(s)…`);
+        for (const f of failed) {
+          await deliverDraft(waId, f.id);
+        }
       } else {
         await safeSend(waId, 'No veo ningún recuerdo con error. ¿Creamos uno nuevo? Mándame una foto.');
       }
@@ -489,27 +495,17 @@ async function handleRecuerdo(waId, messageId, type, msg, text) {
 
 async function finishRecuerdo(waId, activity) {
   try {
-    await store.updateActivity(activity.id, { status: 'procesando' });
-    // Puente con Legado Vivo (app pública): envía el borrador si está configurado.
-    // Si no, el borrador sigue siendo el registro en el almacén (comportamiento anterior).
-    let puente = null;
-    if (bridgeEnabled()) {
-      puente = await forwardDraft(activity, store, fastify.log);
-    }
-    await store.updateActivity(activity.id, { status: 'terminado', puenteLegado: puente });
-
-    // El recuerdo queda cerrado, pero se abre la ventana para personas/fecha.
+    // El envío a Legado Vivo corre en segundo plano con reintentos (v6):
+    // no se bloquea el webhook y ningún fallo silencioso pierde el borrador.
+    await store.updateActivity(activity.id, { status: 'entregando' });
     const session = await store.getSession(waId);
     session.openActivityId = null;
-    session.awaitingDetails = activity.id;
-    session.awaitingDetailsAnswer = false;
     await store.saveSession(session);
-
-    const extra =
-      puente && puente.ok
-        ? '\nYa lo guardé en tu familia de Legado Vivo (pendiente de completar).'
-        : '';
-    await safeSend(waId, `Recuerdo preparado. ¿Quieres agregar personas y fecha?${extra}\n${deepLink(activity.id)}`);
+    await safeSend(waId, `Recuerdo preparado. Lo estoy enviando a tu familia de Legado Vivo…\n${deepLink(activity.id)}`);
+    // Fire-and-forget con registro de errores.
+    deliverDraft(waId, activity.id).catch((err) =>
+      fastify.log.error(err, `Error inesperado entregando borrador ${activity.id}.`)
+    );
   } catch (err) {
     fastify.log.error(err, 'Error finalizando recuerdo.');
     await store.updateActivity(activity.id, { status: 'error' });
@@ -517,6 +513,77 @@ async function finishRecuerdo(waId, activity) {
       waId,
       'No pude terminar el recuerdo por un error. Responde "reintentar" o vuelve a intentarlo en un momento.'
     );
+  }
+}
+
+// Entrega un borrador a Legado Vivo con persistencia: reintentos con backoff
+// (ver legado-bridge.js). Al final avisa al usuario el resultado real.
+async function deliverDraft(waId, activityId) {
+  const activity = await store.getActivity(activityId);
+  if (!activity) {
+    fastify.log.warn(`deliverDraft: actividad ${activityId} no encontrada.`);
+    return;
+  }
+  // Idempotencia: si la app ya lo tiene (reintento anterior exitoso), no se duplica.
+  if (activity.puenteLegado && activity.puenteLegado.ok) {
+    fastify.log.info(`deliverDraft: actividad ${activityId} ya entregada, se omite.`);
+    return;
+  }
+  let puente = null;
+  if (bridgeEnabled()) {
+    puente = await forwardDraft(activity, store, fastify.log);
+  }
+  if (puente && puente.ok) {
+    await store.updateActivity(activity.id, { status: 'terminado', puenteLegado: puente, puenteError: null });
+    // Se abre la ventana para personas/fecha.
+    const session = await store.getSession(waId);
+    session.awaitingDetails = activity.id;
+    session.awaitingDetailsAnswer = false;
+    await store.saveSession(session);
+    const fotoNota = puente.photoMissing ? ' (ojo: llegó sin la foto, no se pudo descargar)' : '';
+    await safeSend(
+      waId,
+      `✅ Ya quedó en tu familia de Legado Vivo (pendiente de completar)${fotoNota}. ¿Quieres agregar personas y fecha?\n${deepLink(activity.id)}`
+    );
+  } else {
+    await store.updateActivity(activity.id, {
+      status: 'error',
+      puenteLegado: puente,
+      puenteError: (puente && puente.error) || 'puente no configurado',
+    });
+    await safeSend(
+      waId,
+      `⚠️ No pude enviarlo a Legado Vivo después de varios intentos (${(puente && puente.error) || 'puente no configurado'}). ` +
+        `Tu foto y tu relato están a salvo aquí. Responde "reintentar" y lo intento de nuevo.`
+    );
+  }
+}
+
+// Barrido de recuperación: al arrancar, reintenta los borradores que nunca
+// llegaron a Legado Vivo (fallos silenciosos de versiones anteriores).
+async function recoverFailedDeliveries() {
+  try {
+    if (!bridgeEnabled()) {
+      fastify.log.info('recoverFailedDeliveries: puente no configurado, se omite.');
+      return;
+    }
+    const failed = await store.listBridgeFailed();
+    if (!failed.length) {
+      fastify.log.info('recoverFailedDeliveries: sin entregas pendientes.');
+      return;
+    }
+    fastify.log.info(`recoverFailedDeliveries: ${failed.length} borrador(es) por recuperar.`);
+    for (const a of failed) {
+      try {
+        await deliverDraft(a.userWaId, a.id);
+      } catch (err) {
+        fastify.log.error(err, `recoverFailedDeliveries: fallo con actividad ${a.id}.`);
+      }
+      // Pausa breve para no saturar a la app recién despertada.
+      await new Promise((res) => setTimeout(res, 3000));
+    }
+  } catch (err) {
+    fastify.log.error(err, 'recoverFailedDeliveries: error en el barrido.');
   }
 }
 
@@ -554,6 +621,11 @@ async function start() {
   try {
     await fastify.listen({ port: PORT, host: '0.0.0.0' });
     fastify.log.info(`Asistente Puente escuchando en puerto ${PORT}`);
+    // Barrido de recuperación (v6): reintenta en segundo plano los borradores
+    // que nunca llegaron a Legado Vivo. No bloquea el arranque.
+    setTimeout(() => {
+      recoverFailedDeliveries().catch((err) => fastify.log.error(err, 'Barrido de recuperación falló.'));
+    }, 45000);
   } catch (err) {
     fastify.log.error(err);
     process.exit(1);

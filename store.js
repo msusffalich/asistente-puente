@@ -242,6 +242,28 @@ async function listActivities(waId) {
 }
 
 /**
+ * Actividades cuyo borrador NO llegó a Legado Vivo: las que quedaron con
+ * puenteLegado.ok === false (fallos v5, marcadas 'terminado') o con
+ * status 'error' (fallos v6 tras todos los reintentos).
+ */
+async function listBridgeFailed() {
+  if (usePostgres) {
+    const r = await pool.query(
+      `SELECT data FROM puente_activities
+       WHERE (data->'puenteLegado'->>'ok' = 'false')
+          OR (data->>'status' = 'error')
+       ORDER BY created_at ASC LIMIT 100`
+    );
+    return r.rows.map((row) => row.data);
+  }
+  return jdb()
+    .activities.filter(
+      (a) => (a.puenteLegado && a.puenteLegado.ok === false) || a.status === 'error'
+    )
+    .sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1));
+}
+
+/**
  * Guarda un archivo descargado (foto o audio).
  * - Modo postgres: guarda los bytes en la tabla puente_media, devuelve
  *   { storage: 'db', ref: 'db:<id>', mime, filename }.
@@ -293,6 +315,7 @@ module.exports = {
   getActivity,
   updateActivity,
   listActivities,
+  listBridgeFailed,
   saveMediaFile,
   linkMedia,
   getMediaFile,
